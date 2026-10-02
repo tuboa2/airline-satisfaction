@@ -41,6 +41,12 @@ def parse_args():
         default=42,
         help="Random seed for reproducibility (default: 42)"
     )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="",
+        help="Custom directory containing train.csv and test.csv (default: auto-detect)"
+    )
     return parser.parse_args()
 
 
@@ -48,7 +54,7 @@ def main():
     logger = get_logger("AirlineTraining")
     args = parse_args()
 
-    paths = PathConfig()
+    paths = PathConfig(raw_dir=args.data_dir) if args.data_dir else PathConfig()
     feature_cfg = FeatureConfig()
     train_cfg = TrainConfig(n_splits=args.folds, random_state=args.seed)
 

@@ -16,20 +16,30 @@ class PathConfig:
     sample_sub_path: str = ""
     output_dir: str = "outputs"
     submissions_dir: str = "submissions"
-
     def __post_init__(self):
-        # Kaggle input paths
-        kaggle_raw = "/kaggle/input/playground-series-s6e10"
-        local_raw = "data/raw"
-        alt_local_raw = "../data/raw"
+        if not self.raw_dir:
+            import glob
+            candidates = [
+                "/kaggle/input/competitions/playground-series-s6e10",
+                "/kaggle/input/playground-series-s6e10",
+                "data/raw",
+                "../data/raw",
+                "../../data/raw",
+                "."
+            ]
 
-        if os.path.exists(kaggle_raw):
-            self.raw_dir = kaggle_raw
-        elif os.path.exists(local_raw):
-            self.raw_dir = local_raw
-        elif os.path.exists(alt_local_raw):
-            self.raw_dir = alt_local_raw
-        else:
+            # Dynamic auto-discovery on Kaggle filesystem
+            if os.path.exists("/kaggle/input"):
+                kaggle_matches = glob.glob("/kaggle/input/**/train.csv", recursive=True)
+                if kaggle_matches:
+                    candidates.insert(0, os.path.dirname(kaggle_matches[0]))
+
+            for cand in candidates:
+                if os.path.exists(os.path.join(cand, "train.csv")):
+                    self.raw_dir = cand
+                    break
+
+        if not self.raw_dir:
             self.raw_dir = "."
 
         self.train_path = os.path.join(self.raw_dir, "train.csv")
