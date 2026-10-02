@@ -41,6 +41,10 @@ class LightGBMModel(BaseModel):
             self.params["device"] = "cpu"
             self.params["n_jobs"] = -1
 
+        # Sanitize any accidental foreign hyperparameters
+        for invalid_key in ["loss_function", "eval_metric", "task_type", "thread_count", "l2_leaf_reg", "iterations", "tree_method"]:
+            self.params.pop(invalid_key, None)
+
     def fit(self, X_train, y_train, X_val, y_val) -> None:
         import lightgbm as lgb
         trn_data = lgb.Dataset(X_train, label=y_train)
@@ -51,10 +55,13 @@ class LightGBMModel(BaseModel):
             lgb.log_evaluation(period=250)
         ]
 
+        num_boost_round = self.params.pop("n_estimators", 2500)
+
         try:
             self.model = lgb.train(
                 self.params,
                 trn_data,
+                num_boost_round=num_boost_round,
                 valid_sets=[trn_data, val_data],
                 valid_names=["train", "valid"],
                 callbacks=callbacks
@@ -68,6 +75,7 @@ class LightGBMModel(BaseModel):
                 self.model = lgb.train(
                     self.params,
                     trn_data,
+                    num_boost_round=num_boost_round,
                     valid_sets=[trn_data, val_data],
                     valid_names=["train", "valid"],
                     callbacks=callbacks
@@ -91,14 +99,23 @@ class CatBoostModel(BaseModel):
             self.params["task_type"] = "CPU"
             self.params["thread_count"] = -1
 
+        # Prevent duplicate/conflicting parameter errors
+        self.early_stopping_rounds = self.params.pop("early_stopping_rounds", 100)
+        self.verbose = self.params.pop("verbose", 250)
+
+        # Sanitize any accidental foreign hyperparameters
+        for invalid_key in ["metric", "objective", "boosting_type", "n_estimators", "num_leaves", "colsample_bytree", "subsample", "tree_method"]:
+            self.params.pop(invalid_key, None)
+
         self.model = CatBoostClassifier(**self.params)
 
     def fit(self, X_train, y_train, X_val, y_val) -> None:
         self.model.fit(
             X_train, y_train,
             eval_set=(X_val, y_val),
-            early_stopping_rounds=100,
-            verbose=250
+            early_stopping_rounds=self.early_stopping_rounds,
+            verbose=self.verbose,
+            use_best_model=True
         )
 
     def predict_proba(self, X) -> np.ndarray:
@@ -118,13 +135,21 @@ class XGBoostModel(BaseModel):
             self.params["device"] = "cpu"
             self.params["n_jobs"] = -1
 
-        self.model = XGBClassifier(**self.params)
+        # Prevent duplicate/conflicting parameter errors
+        self.early_stopping_rounds = self.params.pop("early_stopping_rounds", 100)
+        self.verbose = self.params.pop("verbose", 250)
+
+        # Sanitize any accidental foreign hyperparameters
+        for invalid_key in ["metric", "loss_function", "task_type", "thread_count", "l2_leaf_reg", "num_leaves", "boosting_type"]:
+            self.params.pop(invalid_key, None)
+
+        self.model = XGBClassifier(**self.params, early_stopping_rounds=self.early_stopping_rounds)
 
     def fit(self, X_train, y_train, X_val, y_val) -> None:
         self.model.fit(
             X_train, y_train,
             eval_set=[(X_val, y_val)],
-            verbose=250
+            verbose=self.verbose
         )
 
     def predict_proba(self, X) -> np.ndarray:

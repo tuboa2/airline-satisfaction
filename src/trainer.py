@@ -96,7 +96,13 @@ class CrossValidationEngine:
         test_preds = np.zeros(len(X_test), dtype=np.float32)
         fold_scores = []
 
-        params = getattr(self.train_cfg, f"{self.model_name[:3]}_params", self.train_cfg.lgb_params)
+        model_name_lower = self.model_name.lower()
+        if "cat" in model_name_lower or "cb" in model_name_lower:
+            params = self.train_cfg.cb_params.copy()
+        elif "xgb" in model_name_lower or "xgboost" in model_name_lower:
+            params = self.train_cfg.xgb_params.copy()
+        else:
+            params = self.train_cfg.lgb_params.copy()
 
         for fold, (train_idx, val_idx) in enumerate(skf.split(X_train, y)):
             logging.info("-" * 50)
@@ -106,7 +112,7 @@ class CrossValidationEngine:
             X_tr, y_tr = X_train.iloc[train_idx], y[train_idx]
             X_va, y_va = X_train.iloc[val_idx], y[val_idx]
 
-            model = get_model(self.model_name, params=params, device=self.device)
+            model = get_model(self.model_name, params=params.copy(), device=self.device)
 
             with timer(f"Fold {fold + 1} Training"):
                 model.fit(X_tr, y_tr, X_va, y_va)

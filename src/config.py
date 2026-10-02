@@ -140,6 +140,7 @@ class TrainConfig:
         "depth": 7,
         "l2_leaf_reg": 3.0,
         "random_seed": 42,
+        "early_stopping_rounds": 100,
         "verbose": 250
     })
 
@@ -155,3 +156,15 @@ class TrainConfig:
         "random_state": 42,
         "tree_method": "hist"
     })
+
+    @property
+    def cat_params(self) -> Dict[str, Any]:
+        return self.cb_params
+
+    @property
+    def lightgbm_params(self) -> Dict[str, Any]:
+        return self.lgb_params
+
+    @property
+    def xgboost_params(self) -> Dict[str, Any]:
+        return self.xgb_params
