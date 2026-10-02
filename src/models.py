@@ -319,6 +319,8 @@ class FTTransformerModel(BaseModel):
         t_y = torch.tensor(y_train, dtype=torch.float32)
 
         has_distill = (teacher_train is not None)
+        has_consistency = (X_test is not None and teacher_test is not None)
+
         if has_distill:
             t_teach = torch.tensor(teacher_train, dtype=torch.float32)
             train_dataset = TensorDataset(t_X_num, t_X_cat, t_y, t_teach)
@@ -326,6 +328,24 @@ class FTTransformerModel(BaseModel):
             train_dataset = TensorDataset(t_X_num, t_X_cat, t_y)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+        # Domain C: Prepare Unlabeled Test Data Loader with Soft Teacher Targets
+        if has_consistency:
+            X_te_num = X_test[self.num_cols].values.astype(np.float32)
+            X_te_num = np.nan_to_num((X_te_num - self.num_mean) / self.num_std)
+            if self.cat_cols:
+                X_te_cat = np.clip(X_test[self.cat_cols].values.astype(np.int64), 0, None)
+            else:
+                X_te_cat = np.zeros((len(X_test), 0), dtype=np.int64)
+
+            t_te_num = torch.tensor(X_te_num, dtype=torch.float32)
+            t_te_cat = torch.tensor(X_te_cat, dtype=torch.long)
+            t_te_teach = torch.tensor(teacher_test, dtype=torch.float32)
+
+            test_dataset = TensorDataset(t_te_num, t_te_cat, t_te_teach)
+            test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+            test_iter = iter(test_loader)
+            logging.info(f"Initialized Domain C Test Consistency Regularizer on {len(X_test)} test rows.")
 
         v_X_num = torch.tensor(X_va_num, dtype=torch.float32).to(device)
         v_X_cat = torch.tensor(X_va_cat, dtype=torch.long).to(device)
@@ -357,10 +377,23 @@ class FTTransformerModel(BaseModel):
                     logits = self.model(b_num, b_cat)
                     loss = bce_loss_fn(logits, b_y)
 
-                    # Domain C: Soft Distillation
+                    # Domain C: Soft Distillation on Training Data
                     if b_teach is not None:
                         distill_loss = bce_loss_fn(logits, b_teach)
                         loss = (1.0 - distill_alpha) * loss + distill_alpha * distill_loss
+
+                    # Domain C: Consistency Regularization on Unlabeled Test Data
+                    if has_consistency:
+                        try:
+                            t_num, t_cat, t_teach = next(test_iter)
+                        except StopIteration:
+                            test_iter = iter(test_loader)
+                            t_num, t_cat, t_teach = next(test_iter)
+
+                        t_num, t_cat, t_teach = t_num.to(device), t_cat.to(device), t_teach.to(device)
+                        test_logits = self.model(t_num, t_cat)
+                        consistency_loss = bce_loss_fn(test_logits, t_teach)
+                        loss = loss + consist_lambda * consistency_loss
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)

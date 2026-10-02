@@ -106,18 +106,28 @@ class CrossValidationEngine:
         else:
             params = self.train_cfg.lgb_params.copy()
 
-        # Domain C: Check for GBDT Teacher Predictions for Soft Distillation
+        # Domain C: Check for GBDT Teacher Predictions for Soft Distillation & Test Consistency
         teacher_oof = None
+        teacher_test = None
         if "transformer" in model_name_lower or "ft" in model_name_lower or "nn" in model_name_lower:
-            teacher_files = [
+            teacher_oof_files = [
                 os.path.join(self.paths.output_dir, "oof_preds_lightgbm.npy"),
                 os.path.join(self.paths.output_dir, "oof_preds_xgboost.npy"),
                 os.path.join(self.paths.output_dir, "oof_preds_catboost.npy"),
             ]
-            valid_teachers = [np.load(f) for f in teacher_files if os.path.exists(f)]
-            if valid_teachers:
-                teacher_oof = np.mean(valid_teachers, axis=0)
-                logging.info(f"Loaded {len(valid_teachers)} GBDT teacher models for soft distillation.")
+            teacher_test_files = [
+                os.path.join(self.paths.output_dir, "test_preds_lightgbm.npy"),
+                os.path.join(self.paths.output_dir, "test_preds_xgboost.npy"),
+                os.path.join(self.paths.output_dir, "test_preds_catboost.npy"),
+            ]
+            valid_oof = [np.load(f) for f in teacher_oof_files if os.path.exists(f)]
+            valid_test = [np.load(f) for f in teacher_test_files if os.path.exists(f)]
+            if valid_oof:
+                teacher_oof = np.mean(valid_oof, axis=0)
+                logging.info(f"Loaded {len(valid_oof)} GBDT teacher models for training soft distillation.")
+            if valid_test:
+                teacher_test = np.mean(valid_test, axis=0)
+                logging.info(f"Loaded {len(valid_test)} GBDT teacher models for test consistency regularization.")
 
         for fold, (train_idx, val_idx) in enumerate(skf.split(X_train, y)):
             logging.info("-" * 50)
@@ -131,7 +141,12 @@ class CrossValidationEngine:
             model = get_model(self.model_name, params=params.copy(), device=self.device)
 
             with timer(f"Fold {fold + 1} Training"):
-                model.fit(X_tr, y_tr, X_va, y_va, teacher_train=teacher_tr)
+                model.fit(
+                    X_tr, y_tr, X_va, y_va,
+                    teacher_train=teacher_tr,
+                    X_test=X_test,
+                    teacher_test=teacher_test
+                )
 
             val_preds = model.predict_proba(X_va)
             oof_preds[val_idx] = val_preds
