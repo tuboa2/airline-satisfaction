@@ -160,6 +160,12 @@ class CrossValidationEngine:
 
             # Clean memory
             del X_tr, y_tr, X_va, y_va, model
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
             gc.collect()
 
         # 4. Overall Out-Of-Fold Evaluation

@@ -3,6 +3,7 @@ Configuration and Global Constants for Airline Passenger Satisfaction
 """
 
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 

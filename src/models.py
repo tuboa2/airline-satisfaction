@@ -347,15 +347,26 @@ class FTTransformerModel(BaseModel):
             test_iter = iter(test_loader)
             logging.info(f"Initialized Domain C Test Consistency Regularizer on {len(X_test)} test rows.")
 
-        v_X_num = torch.tensor(X_va_num, dtype=torch.float32).to(device)
-        v_X_cat = torch.tensor(X_va_cat, dtype=torch.long).to(device)
+        v_X_num = torch.tensor(X_va_num, dtype=torch.float32)
+        v_X_cat = torch.tensor(X_va_cat, dtype=torch.long)
 
         # 7. Optimizer, Scaler & Scheduler
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-        bce_loss_fn = nn.BCEWithLogitsLoss()
+        
+        # PyTorch modern AMP context helper
+        try:
+            from torch.amp import GradScaler, autocast
+            scaler = GradScaler("cuda", enabled=use_amp)
+            def amp_context():
+                return autocast("cuda", enabled=use_amp)
+        except (ImportError, TypeError):
+            from torch.cuda.amp import GradScaler, autocast
+            scaler = GradScaler(enabled=use_amp)
+            def amp_context():
+                return autocast(enabled=use_amp)
 
+        bce_loss_fn = nn.BCEWithLogitsLoss()
         best_auc = 0.0
         best_state = None
 
@@ -373,7 +384,7 @@ class FTTransformerModel(BaseModel):
                     b_num, b_cat, b_y = [item.to(device) for item in batch]
                     b_teach = None
 
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with amp_context():
                     logits = self.model(b_num, b_cat)
                     loss = bce_loss_fn(logits, b_y)
 
@@ -403,12 +414,18 @@ class FTTransformerModel(BaseModel):
 
             scheduler.step()
 
-            # Validation Evaluation
+            # Validation Evaluation (Chunked to 2048 rows to completely prevent CUDA OOM)
             self.model.eval()
+            val_probs = []
+            val_chunk_size = 2048
             with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    val_logits = self.model(v_X_num, v_X_cat)
-                    val_probs = torch.sigmoid(val_logits).cpu().numpy()
+                for vi in range(0, len(y_val), val_chunk_size):
+                    vb_num = v_X_num[vi:vi + val_chunk_size].to(device)
+                    vb_cat = v_X_cat[vi:vi + val_chunk_size].to(device)
+                    with amp_context():
+                        vb_logits = self.model(vb_num, vb_cat)
+                        val_probs.append(torch.sigmoid(vb_logits).cpu().numpy())
+            val_probs = np.concatenate(val_probs, axis=0)
 
             val_auc = roc_auc_score(y_val, val_probs)
             logging.info(f"Epoch {epoch}/{epochs} | Loss: {running_loss / len(train_loader):.4f} | Val ROC-AUC: {val_auc:.5f}")
@@ -421,6 +438,9 @@ class FTTransformerModel(BaseModel):
             self.model.load_state_dict(best_state)
             self.model.to(device)
             logging.info(f"Loaded Best FT-Transformer State (Validation ROC-AUC: {best_auc:.5f})")
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def predict_proba(self, X) -> np.ndarray:
         import torch
@@ -435,16 +455,29 @@ class FTTransformerModel(BaseModel):
         else:
             X_cat = np.zeros((len(X), 0), dtype=np.int64)
 
-        batch_size = 4096
+        try:
+            from torch.amp import autocast
+            def amp_context():
+                return autocast("cuda", enabled=(device.type == "cuda"))
+        except (ImportError, TypeError):
+            from torch.cuda.amp import autocast
+            def amp_context():
+                return autocast(enabled=(device.type == "cuda"))
+
+        batch_size = 2048
         probs = []
 
         with torch.no_grad():
             for i in range(0, len(X), batch_size):
                 b_num = torch.tensor(X_num[i:i + batch_size], dtype=torch.float32).to(device)
                 b_cat = torch.tensor(X_cat[i:i + batch_size], dtype=torch.long).to(device)
-                logits = self.model(b_num, b_cat)
-                p = torch.sigmoid(logits).cpu().numpy()
+                with amp_context():
+                    logits = self.model(b_num, b_cat)
+                    p = torch.sigmoid(logits).cpu().numpy()
                 probs.append(p)
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         return np.concatenate(probs, axis=0)
 
