@@ -95,6 +95,14 @@ class CatBoostModel(BaseModel):
         self.params = params.copy() if params else {}
         if device == "cuda":
             self.params["task_type"] = "GPU"
+            try:
+                import torch
+                if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                    gpu_ids = ":".join(str(i) for i in range(torch.cuda.device_count()))
+                    self.params["devices"] = gpu_ids
+                    logging.info(f"CatBoost configured for multi-GPU training on devices: {gpu_ids}")
+            except Exception:
+                pass
         else:
             self.params["task_type"] = "CPU"
             self.params["thread_count"] = -1
@@ -276,34 +284,49 @@ class FTTransformerModel(BaseModel):
                 )
 
             def forward(self, x_num, x_cat):
-                B = x_num.size(0)
-                tokens = [self.cls_token.expand(B, -1, -1)]
+                amp_enabled = x_num.is_cuda
+                try:
+                    from torch.amp import autocast
+                    ctx = autocast("cuda", enabled=amp_enabled)
+                except (ImportError, TypeError):
+                    from torch.cuda.amp import autocast
+                    ctx = autocast(enabled=amp_enabled)
 
-                if self.num_w is not None and x_num.size(1) > 0:
-                    num_toks = x_num.unsqueeze(-1) * self.num_w + self.num_b
-                    tokens.append(num_toks)
+                with ctx:
+                    B = x_num.size(0)
+                    tokens = [self.cls_token.expand(B, -1, -1)]
 
-                if len(self.cat_embs) > 0 and x_cat.size(1) > 0:
-                    cat_toks = torch.stack([
-                        emb(x_cat[:, i]) for i, emb in enumerate(self.cat_embs)
-                    ], dim=1)
-                    tokens.append(cat_toks)
+                    if self.num_w is not None and x_num.size(1) > 0:
+                        num_toks = x_num.unsqueeze(-1) * self.num_w + self.num_b
+                        tokens.append(num_toks)
 
-                x = torch.cat(tokens, dim=1)
-                for blk in self.blocks:
-                    # Pre-LN Self-Attention
-                    nx = blk["norm1"](x)
-                    attn_out, _ = blk["mha"](nx, nx, nx)
-                    x = x + blk["drop1"](attn_out)
-                    # Pre-LN FeedForward
-                    nx = blk["norm2"](x)
-                    ffn_out = blk["ffn"](nx)
-                    x = x + blk["drop2"](ffn_out)
+                    if len(self.cat_embs) > 0 and x_cat.size(1) > 0:
+                        cat_toks = torch.stack([
+                            emb(x_cat[:, i]) for i, emb in enumerate(self.cat_embs)
+                        ], dim=1)
+                        tokens.append(cat_toks)
 
-                cls_feat = self.head_norm(x[:, 0])
-                return self.head(cls_feat).squeeze(-1)
+                    x = torch.cat(tokens, dim=1)
+                    for blk in self.blocks:
+                        # Pre-LN Self-Attention
+                        nx = blk["norm1"](x)
+                        attn_out, _ = blk["mha"](nx, nx, nx)
+                        x = x + blk["drop1"](attn_out)
+                        # Pre-LN FeedForward
+                        nx = blk["norm2"](x)
+                        ffn_out = blk["ffn"](nx)
+                        x = x + blk["drop2"](ffn_out)
 
-        self.model = _FTTransformer(
+                    cls_feat = self.head_norm(x[:, 0])
+                    return self.head(cls_feat).squeeze(-1)
+
+        # Multi-GPU Detection & Scaling
+        n_gpus = torch.cuda.device_count() if (device.type == "cuda") else 0
+        if n_gpus > 1:
+            logging.info(f"Multi-GPU detected ({n_gpus} GPUs)! Scaling batch size and activating torch.nn.DataParallel.")
+            batch_size = batch_size * n_gpus
+
+        raw_model = _FTTransformer(
             n_num=len(self.num_cols),
             cat_cards=cat_cardinalities,
             d=embed_dim,
@@ -313,7 +336,12 @@ class FTTransformerModel(BaseModel):
             drop=dropout
         ).to(device)
 
-        # 6. Tensor Datasets and Loaders
+        if n_gpus > 1:
+            self.model = nn.DataParallel(raw_model)
+        else:
+            self.model = raw_model
+
+        # 6. Tensor Datasets and Multi-threaded Loaders
         t_X_num = torch.tensor(X_tr_num, dtype=torch.float32)
         t_X_cat = torch.tensor(X_tr_cat, dtype=torch.long)
         t_y = torch.tensor(y_train, dtype=torch.float32)
@@ -327,7 +355,15 @@ class FTTransformerModel(BaseModel):
         else:
             train_dataset = TensorDataset(t_X_num, t_X_cat, t_y)
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        n_workers = min(2, os.cpu_count() or 1)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=(device.type == "cuda"),
+            num_workers=n_workers
+        )
 
         # Domain C: Prepare Unlabeled Test Data Loader with Soft Teacher Targets
         if has_consistency:
@@ -343,7 +379,14 @@ class FTTransformerModel(BaseModel):
             t_te_teach = torch.tensor(teacher_test, dtype=torch.float32)
 
             test_dataset = TensorDataset(t_te_num, t_te_cat, t_te_teach)
-            test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=True,
+                pin_memory=(device.type == "cuda"),
+                num_workers=n_workers
+            )
             test_iter = iter(test_loader)
             logging.info(f"Initialized Domain C Test Consistency Regularizer on {len(X_test)} test rows.")
 
@@ -414,17 +457,16 @@ class FTTransformerModel(BaseModel):
 
             scheduler.step()
 
-            # Validation Evaluation (Chunked to 2048 rows to completely prevent CUDA OOM)
+            # Validation Evaluation (Chunked to prevent CUDA OOM, accelerated across GPUs)
             self.model.eval()
             val_probs = []
-            val_chunk_size = 2048
+            val_chunk_size = 2048 * max(1, n_gpus)
             with torch.no_grad():
                 for vi in range(0, len(y_val), val_chunk_size):
                     vb_num = v_X_num[vi:vi + val_chunk_size].to(device)
                     vb_cat = v_X_cat[vi:vi + val_chunk_size].to(device)
-                    with amp_context():
-                        vb_logits = self.model(vb_num, vb_cat)
-                        val_probs.append(torch.sigmoid(vb_logits).cpu().numpy())
+                    vb_logits = self.model(vb_num, vb_cat)
+                    val_probs.append(torch.sigmoid(vb_logits).cpu().numpy())
             val_probs = np.concatenate(val_probs, axis=0)
 
             val_auc = roc_auc_score(y_val, val_probs)
@@ -432,11 +474,12 @@ class FTTransformerModel(BaseModel):
 
             if val_auc > best_auc:
                 best_auc = val_auc
-                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+                best_state = {k: v.cpu().clone() for k, v in m_to_save.state_dict().items()}
 
         if best_state is not None:
-            self.model.load_state_dict(best_state)
-            self.model.to(device)
+            m_to_save = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            m_to_save.load_state_dict(best_state)
             logging.info(f"Loaded Best FT-Transformer State (Validation ROC-AUC: {best_auc:.5f})")
 
         if device.type == "cuda":
@@ -455,25 +498,16 @@ class FTTransformerModel(BaseModel):
         else:
             X_cat = np.zeros((len(X), 0), dtype=np.int64)
 
-        try:
-            from torch.amp import autocast
-            def amp_context():
-                return autocast("cuda", enabled=(device.type == "cuda"))
-        except (ImportError, TypeError):
-            from torch.cuda.amp import autocast
-            def amp_context():
-                return autocast(enabled=(device.type == "cuda"))
-
-        batch_size = 2048
+        n_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
+        batch_size = 4096 * max(1, n_gpus)
         probs = []
 
         with torch.no_grad():
             for i in range(0, len(X), batch_size):
                 b_num = torch.tensor(X_num[i:i + batch_size], dtype=torch.float32).to(device)
                 b_cat = torch.tensor(X_cat[i:i + batch_size], dtype=torch.long).to(device)
-                with amp_context():
-                    logits = self.model(b_num, b_cat)
-                    p = torch.sigmoid(logits).cpu().numpy()
+                logits = self.model(b_num, b_cat)
+                p = torch.sigmoid(logits).cpu().numpy()
                 probs.append(p)
 
         if device.type == "cuda":
