@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Data files (keep repo lightweight for GitHub & Kaggle pull)
+data/
+*.csv
+*.zip
+*.parquet
+*.feather
+*.log
+
+# Outputs & Artifacts
+eda_figures/
+eda_outputs/
+models_checkpoints/
+submissions/
+*.pkl
+*.joblib
+
+# IDE & System
+.DS_Store
+.idea/
+.vscode/
