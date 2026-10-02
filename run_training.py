@@ -19,7 +19,7 @@ def parse_args():
         "--model",
         type=str,
         default="lightgbm",
-        choices=["lightgbm", "catboost", "xgboost"],
+        choices=["lightgbm", "catboost", "xgboost", "transformer", "ft_transformer"],
         help="Model architecture to train (default: lightgbm)"
     )
     parser.add_argument(

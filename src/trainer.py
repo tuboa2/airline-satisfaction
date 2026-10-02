@@ -74,8 +74,8 @@ class CrossValidationEngine:
 
         test_ids = test_df[self.feature_cfg.id_col].values
 
-        # 2. Feature Engineering
-        X_train = self.pipeline.fit_transform(train_df)
+        # 2. Transductive Feature Engineering (Domain A & Domain C)
+        X_train = self.pipeline.fit_transform(train_df, test_df)
         X_test = self.pipeline.transform(test_df, is_train=False)
 
         feature_names = X_train.columns.tolist()
@@ -101,8 +101,23 @@ class CrossValidationEngine:
             params = self.train_cfg.cb_params.copy()
         elif "xgb" in model_name_lower or "xgboost" in model_name_lower:
             params = self.train_cfg.xgb_params.copy()
+        elif "transformer" in model_name_lower or "ft" in model_name_lower or "nn" in model_name_lower:
+            params = self.train_cfg.ft_params.copy()
         else:
             params = self.train_cfg.lgb_params.copy()
+
+        # Domain C: Check for GBDT Teacher Predictions for Soft Distillation
+        teacher_oof = None
+        if "transformer" in model_name_lower or "ft" in model_name_lower or "nn" in model_name_lower:
+            teacher_files = [
+                os.path.join(self.paths.output_dir, "oof_preds_lightgbm.npy"),
+                os.path.join(self.paths.output_dir, "oof_preds_xgboost.npy"),
+                os.path.join(self.paths.output_dir, "oof_preds_catboost.npy"),
+            ]
+            valid_teachers = [np.load(f) for f in teacher_files if os.path.exists(f)]
+            if valid_teachers:
+                teacher_oof = np.mean(valid_teachers, axis=0)
+                logging.info(f"Loaded {len(valid_teachers)} GBDT teacher models for soft distillation.")
 
         for fold, (train_idx, val_idx) in enumerate(skf.split(X_train, y)):
             logging.info("-" * 50)
@@ -111,11 +126,12 @@ class CrossValidationEngine:
 
             X_tr, y_tr = X_train.iloc[train_idx], y[train_idx]
             X_va, y_va = X_train.iloc[val_idx], y[val_idx]
+            teacher_tr = teacher_oof[train_idx] if teacher_oof is not None else None
 
             model = get_model(self.model_name, params=params.copy(), device=self.device)
 
             with timer(f"Fold {fold + 1} Training"):
-                model.fit(X_tr, y_tr, X_va, y_va)
+                model.fit(X_tr, y_tr, X_va, y_va, teacher_train=teacher_tr)
 
             val_preds = model.predict_proba(X_va)
             oof_preds[val_idx] = val_preds

@@ -104,6 +104,25 @@ class FeatureConfig:
     })
 
 
+    # Domain A & C: Forensic density and transductive parameters
+    enable_density_forensics: bool = True
+    enable_high_order_freq: bool = True
+    core_centroid_cols: List[str] = field(default_factory=lambda: [
+        "Online boarding",
+        "Inflight wifi service",
+        "Checkin service",
+        "On-board service",
+        "Cleanliness",
+        "Leg room service",
+        "Seat comfort",
+        "Arrival Delay in Minutes",
+        "Flight Distance",
+        "Age"
+    ])
+    kmeans_clusters_per_class: int = 8
+    kmeans_anomaly_clusters: int = 16
+
+
 @dataclass
 class TrainConfig:
     """Training, cross-validation, and optimization settings."""
@@ -157,6 +176,22 @@ class TrainConfig:
         "tree_method": "hist"
     })
 
+    # Domain D: Compact FT-Transformer Architecture & Training Parameters
+    ft_params: Dict[str, Any] = field(default_factory=lambda: {
+        "embed_dim": 32,
+        "num_layers": 3,
+        "num_heads": 4,
+        "ffn_ratio": 2,
+        "dropout": 0.1,
+        "lr": 1.5e-3,
+        "weight_decay": 1e-4,
+        "batch_size": 2048,
+        "epochs": 7,
+        "distillation_alpha": 0.5,
+        "consistency_lambda": 0.15,
+        "random_state": 42
+    })
+
     @property
     def cat_params(self) -> Dict[str, Any]:
         return self.cb_params
@@ -168,3 +203,11 @@ class TrainConfig:
     @property
     def xgboost_params(self) -> Dict[str, Any]:
         return self.xgb_params
+
+    @property
+    def transformer_params(self) -> Dict[str, Any]:
+        return self.ft_params
+
+    @property
+    def nn_params(self) -> Dict[str, Any]:
+        return self.ft_params
