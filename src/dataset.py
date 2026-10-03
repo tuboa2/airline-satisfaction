@@ -33,12 +33,12 @@ class DatasetIngestion:
         self.train_cfg = train_cfg
         self.logger = get_logger("DatasetIngestion")
 
-    def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _standardize_columns(self, df: pd.DataFrame, is_original: bool = False) -> pd.DataFrame:
         """Standardizes column names and types across datasets."""
         data = df.copy()
 
-        # Drop identifiers and row indices
-        cols_to_drop = ["Unnamed: 0", "id", "ID"]
+        # Drop identifiers and row indices only from original host dataset
+        cols_to_drop = ["Unnamed: 0", "id", "ID"] if is_original else ["Unnamed: 0"]
         drop_existing = [c for c in cols_to_drop if c in data.columns]
         if drop_existing:
             data = data.drop(columns=drop_existing)
@@ -119,9 +119,28 @@ class DatasetIngestion:
             elif self.paths.original_path.endswith(".csv"):
                 candidates.append(self.paths.original_path)
 
+        # Also dynamically search /kaggle/input and standard local directories
+        search_dirs = ["/kaggle/input", "data/original", "data/raw/original", "data/external"]
+        for sdir in search_dirs:
+            if os.path.exists(sdir):
+                all_csvs = glob.glob(os.path.join(sdir, "**", "*.csv"), recursive=True)
+                for f in all_csvs:
+                    f_lower = f.lower()
+                    if "playground-series-s6e10" in f_lower or "competitions" in f_lower or "sample_submission" in f_lower:
+                        continue
+                    if "airline" in f_lower or "satisfaction" in f_lower or "passenger" in f_lower:
+                        candidates.append(f)
+
         # Remove synthetic train/test if accidentally matched
         filtered = []
+        train_abs = os.path.abspath(self.paths.train_path) if self.paths.train_path else ""
+        test_abs = os.path.abspath(self.paths.test_path) if self.paths.test_path else ""
+        sub_abs = os.path.abspath(self.paths.sample_sub_path) if self.paths.sample_sub_path else ""
+
         for c in candidates:
+            c_abs = os.path.abspath(c)
+            if c_abs in [train_abs, test_abs, sub_abs]:
+                continue
             c_base = os.path.basename(c).lower()
             c_dir = os.path.dirname(c).lower()
             if "playground-series-s6e10" in c_dir or "competitions" in c_dir:
@@ -218,8 +237,8 @@ class DatasetIngestion:
         with timer("Dataset Ingestion & Alignment"):
             train_synth = pd.read_csv(self.paths.train_path)
             test_synth = pd.read_csv(self.paths.test_path)
-            train_synth = self._standardize_columns(train_synth)
-            test_synth = self._standardize_columns(test_synth)
+            train_synth = self._standardize_columns(train_synth, is_original=False)
+            test_synth = self._standardize_columns(test_synth, is_original=False)
 
             train_synth["is_original"] = 1
             test_synth["is_original"] = 1
@@ -239,7 +258,7 @@ class DatasetIngestion:
                 for fpath in orig_files:
                     try:
                         part_df = pd.read_csv(fpath)
-                        part_df = self._standardize_columns(part_df)
+                        part_df = self._standardize_columns(part_df, is_original=True)
                         if self.feature_cfg.target_col in part_df.columns:
                             orig_parts.append(part_df)
                     except Exception as e:

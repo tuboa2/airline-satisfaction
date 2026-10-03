@@ -69,7 +69,11 @@ class CrossValidationEngine:
         unified_train, test_synth, sample_weights, orig_df = ingestion.load_and_prepare()
 
         y_all = unified_train[self.feature_cfg.target_col].astype(int).values
-        test_ids = test_synth[self.feature_cfg.id_col].values
+        test_ids = (
+            test_synth[self.feature_cfg.id_col].values
+            if self.feature_cfg.id_col in test_synth.columns
+            else np.arange(len(test_synth))
+        )
 
         # 2. Transductive Feature Engineering
         X_train_all = self.pipeline.fit_transform(unified_train, test_synth)
