@@ -21,9 +21,11 @@ def parse_args():
         type=str,
         default="lightgbm",
         choices=[
-            "lightgbm", "catboost", "xgboost",
-            "resnet", "realmlp", "tabular_resnet",
-            "transformer", "ft_transformer",
+            "lightgbm", "lgbm",
+            "catboost", "cb", "cat",
+            "xgboost", "xgb",
+            "resnet", "realmlp", "tabular_resnet", "nn",
+            "transformer", "ft_transformer", "ft",
         ],
         help="Model architecture to train (default: lightgbm)"
     )
@@ -35,10 +37,29 @@ def parse_args():
         help="Hardware accelerator to use (default: auto-detect)"
     )
     parser.add_argument(
-        "--folds",
+        "--folds", "--n_splits",
+        dest="folds",
         type=int,
         default=5,
         help="Number of cross-validation folds (default: 5)"
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Number of training epochs for neural architectures (e.g. resnet, ft_transformer)"
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Mini-batch size for neural architectures (e.g. 4096)"
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning rate override"
     )
     parser.add_argument(
         "--seed",
@@ -90,6 +111,16 @@ def main():
         original_sample_weight=args.original_weight,
         use_density_ratio_weighting=args.density_ratio,
     )
+
+    if args.epochs is not None:
+        train_cfg.resnet_params["epochs"] = args.epochs
+        train_cfg.ft_params["epochs"] = args.epochs
+    if args.batch_size is not None:
+        train_cfg.resnet_params["batch_size"] = args.batch_size
+        train_cfg.ft_params["batch_size"] = args.batch_size
+    if args.lr is not None:
+        train_cfg.resnet_params["lr"] = args.lr
+        train_cfg.ft_params["lr"] = args.lr
 
     engine = CrossValidationEngine(
         paths=paths,
