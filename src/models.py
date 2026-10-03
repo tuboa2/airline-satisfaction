@@ -2,11 +2,22 @@
 Model Wrappers: High-Performance LightGBM, CatBoost, and XGBoost with GPU/CPU Detection
 """
 
+from __future__ import annotations
+
 import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 import numpy as np
+
+try:
+    import torch
+    import torch.nn as nn
+    _ModuleBase = nn.Module
+except ImportError:
+    torch = None
+    nn = None
+    _ModuleBase = object
 
 
 class BaseModel(ABC):
@@ -611,7 +622,7 @@ class FTTransformerModel(BaseModel):
         return np.concatenate(probs, axis=0)
 
 
-class SurrogateAUCLoss(nn.Module):
+class SurrogateAUCLoss(_ModuleBase):
     """
     Domain 3: Differentiable surrogate ranking loss maximizing ROC-AUC directly via pairwise differences.
     """
@@ -629,7 +640,7 @@ class SurrogateAUCLoss(nn.Module):
         return torch.mean((1.0 - torch.sigmoid(self.gamma * differences)) ** 2)
 
 
-class PeriodicLinearEmbeddings(nn.Module):
+class PeriodicLinearEmbeddings(_ModuleBase):
     """
     Domain 3: Piecewise Linear Representations (PLR) via Sinusoidal Periodic Embeddings.
     Allows neural networks to map irregular piecewise continuous features without GBDT mimicry.
@@ -648,7 +659,7 @@ class PeriodicLinearEmbeddings(nn.Module):
         return self.proj(periodic)
 
 
-class ResNetBlock(nn.Module):
+class ResNetBlock(_ModuleBase):
     """Residual Linear Block with LayerNorm, GELU, and Dropout."""
 
     def __init__(self, d: int, dropout: float = 0.15):
@@ -665,7 +676,7 @@ class ResNetBlock(nn.Module):
         return residual + out
 
 
-class TabularResNetNet(nn.Module):
+class TabularResNetNet(_ModuleBase):
     """
     Pure Un-distilled Tabular ResNet with Periodic Linear Representations (PLR).
     """
