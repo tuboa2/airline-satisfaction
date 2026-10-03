@@ -1,21 +1,26 @@
 """
 Cross-Validation Training Engine: Stratified K-Fold with OOF Scoring and Submission Generation
+Integrates:
+- Domain 1: Original host dataset ingestion, provenance weighting, and leakage mining
+- Domain 3: Un-distilled Tabular ResNet / RealMLP with PLR embeddings
+- Domain 4: Rotational SVD manifolds & Multi-way Bayesian target encoding
 """
 
 import gc
-import os
 import logging
-from typing import Dict, Any, Tuple
+import os
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-from src.config import PathConfig, FeatureConfig, TrainConfig
+from src.config import FeatureConfig, PathConfig, TrainConfig
+from src.dataset import DatasetIngestion
 from src.features import FeaturePipeline
 from src.models import get_model
-from src.utils import timer, detect_hardware, seed_everything
+from src.postprocess import ExactMatchPostprocessor
+from src.utils import detect_hardware, seed_everything, timer
 
 
 class CrossValidationEngine:
@@ -30,7 +35,7 @@ class CrossValidationEngine:
         feature_cfg: FeatureConfig = FeatureConfig(),
         train_cfg: TrainConfig = TrainConfig(),
         model_name: str = "lightgbm",
-        device: str = None
+        device: str = None,
     ):
         self.paths = paths
         self.feature_cfg = feature_cfg
@@ -45,54 +50,56 @@ class CrossValidationEngine:
         seed_everything(self.train_cfg.random_state)
         self.pipeline = FeaturePipeline(self.feature_cfg)
 
-    def run(self) -> Tuple[float, np.ndarray, np.ndarray]:
+    def run(self) -> tuple[float, np.ndarray, np.ndarray]:
         """
         Executes complete training and inference pipeline:
-        1. Loads train and test data.
-        2. Applies full feature pipeline.
-        3. Runs 5-Fold Stratified CV.
-        4. Logs OOF score and exports submission.csv.
+        1. Ingests synthetic train, test, and auxiliary original dataset.
+        2. Applies full feature pipeline (Domain A, C, 4).
+        3. Runs 5-Fold Stratified CV on synthetic target distribution with augmented training.
+        4. Logs OOF score, exports submission.csv, and checks exact-match overrides.
         """
         logging.info("=" * 70)
-        logging.info(f"STARTING CROSS-VALIDATION PIPELINE: Model={self.model_name.upper()} | Device={self.device.upper()}")
+        logging.info(
+            f"STARTING CROSS-VALIDATION PIPELINE: Model={self.model_name.upper()} | Device={self.device.upper()}"
+        )
         logging.info("=" * 70)
 
-        # 1. Load Data
-        with timer("Loading Raw Datasets"):
-            train_df = pd.read_csv(self.paths.train_path)
-            test_df = pd.read_csv(self.paths.test_path)
-            logging.info(f"Train Shape: {train_df.shape} | Test Shape: {test_df.shape}")
+        # 1. Load Data with Domain 1 Ingestion
+        ingestion = DatasetIngestion(self.paths, self.feature_cfg, self.train_cfg)
+        unified_train, test_synth, sample_weights, orig_df = ingestion.load_and_prepare()
 
-        # Standardize target
-        if train_df[self.feature_cfg.target_col].dtype in [object, bool]:
-            y_raw = train_df[self.feature_cfg.target_col].astype(str).str.lower().str.strip()
-            y = (y_raw == "satisfied").astype(int).values
-            if y.sum() == 0:
-                y = (y_raw == "true").astype(int).values
-        else:
-            y = train_df[self.feature_cfg.target_col].astype(int).values
+        y_all = unified_train[self.feature_cfg.target_col].astype(int).values
+        test_ids = test_synth[self.feature_cfg.id_col].values
 
-        test_ids = test_df[self.feature_cfg.id_col].values
+        # 2. Transductive Feature Engineering
+        X_train_all = self.pipeline.fit_transform(unified_train, test_synth)
+        X_test = self.pipeline.transform(test_synth, is_train=False)
 
-        # 2. Transductive Feature Engineering (Domain A & Domain C)
-        X_train = self.pipeline.fit_transform(train_df, test_df)
-        X_test = self.pipeline.transform(test_df, is_train=False)
-
-        feature_names = X_train.columns.tolist()
+        feature_names = X_train_all.columns.tolist()
         logging.info(f"Engineered Feature Count: {len(feature_names)}")
 
-        # Free raw dataframes from memory
-        del train_df, test_df
-        gc.collect()
+        # Isolate synthetic indices for leak-proof CV evaluation
+        synth_mask = (unified_train["is_original"] == 1).values
+        synth_indices = np.where(synth_mask)[0]
+        orig_indices = np.where(~synth_mask)[0]
+        y_synth = y_all[synth_mask]
+
+        logging.info(
+            f"CV Evaluation Plan: {len(synth_indices)} synthetic holdout rows across {self.train_cfg.n_splits} folds."
+        )
+        if len(orig_indices) > 0:
+            logging.info(
+                f"Auxiliary Training Support: {len(orig_indices)} original dataset rows augmenting each fold."
+            )
 
         # 3. Stratified K-Fold Training
         skf = StratifiedKFold(
             n_splits=self.train_cfg.n_splits,
             shuffle=self.train_cfg.shuffle,
-            random_state=self.train_cfg.random_state
+            random_state=self.train_cfg.random_state,
         )
 
-        oof_preds = np.zeros(len(y), dtype=np.float32)
+        oof_preds = np.zeros(len(synth_indices), dtype=np.float32)
         test_preds = np.zeros(len(X_test), dtype=np.float32)
         fold_scores = []
 
@@ -101,15 +108,22 @@ class CrossValidationEngine:
             params = self.train_cfg.cb_params.copy()
         elif "xgb" in model_name_lower or "xgboost" in model_name_lower:
             params = self.train_cfg.xgb_params.copy()
-        elif "transformer" in model_name_lower or "ft" in model_name_lower or "nn" in model_name_lower:
+        elif (
+            "resnet" in model_name_lower
+            or "realmlp" in model_name_lower
+            or "tabular_resnet" in model_name_lower
+            or "nn" in model_name_lower
+        ):
+            params = self.train_cfg.resnet_params.copy()
+        elif "transformer" in model_name_lower or "ft" in model_name_lower:
             params = self.train_cfg.ft_params.copy()
         else:
             params = self.train_cfg.lgb_params.copy()
 
-        # Domain C: Check for GBDT Teacher Predictions for Soft Distillation & Test Consistency
+        # Check for teacher predictions if using distilled FT-Transformer
         teacher_oof = None
         teacher_test = None
-        if "transformer" in model_name_lower or "ft" in model_name_lower or "nn" in model_name_lower:
+        if "transformer" in model_name_lower or "ft" in model_name_lower:
             teacher_oof_files = [
                 os.path.join(self.paths.output_dir, "oof_preds_lightgbm.npy"),
                 os.path.join(self.paths.output_dir, "oof_preds_xgboost.npy"),
@@ -124,42 +138,61 @@ class CrossValidationEngine:
             valid_test = [np.load(f) for f in teacher_test_files if os.path.exists(f)]
             if valid_oof:
                 teacher_oof = np.mean(valid_oof, axis=0)
-                logging.info(f"Loaded {len(valid_oof)} GBDT teacher models for training soft distillation.")
+                logging.info(f"Loaded {len(valid_oof)} GBDT teacher models for soft distillation.")
             if valid_test:
                 teacher_test = np.mean(valid_test, axis=0)
-                logging.info(f"Loaded {len(valid_test)} GBDT teacher models for test consistency regularization.")
+                logging.info(f"Loaded {len(valid_test)} GBDT teacher models for test consistency.")
 
-        for fold, (train_idx, val_idx) in enumerate(skf.split(X_train, y)):
+        for fold, (synth_tr_subidx, synth_va_subidx) in enumerate(skf.split(synth_indices, y_synth)):
             logging.info("-" * 50)
             logging.info(f"FOLD {fold + 1} / {self.train_cfg.n_splits}")
             logging.info("-" * 50)
 
-            X_tr, y_tr = X_train.iloc[train_idx], y[train_idx]
-            X_va, y_va = X_train.iloc[val_idx], y[val_idx]
-            teacher_tr = teacher_oof[train_idx] if teacher_oof is not None else None
+            val_global_idx = synth_indices[synth_va_subidx]
+            if len(orig_indices) > 0:
+                train_global_idx = np.concatenate([synth_indices[synth_tr_subidx], orig_indices])
+            else:
+                train_global_idx = synth_indices[synth_tr_subidx]
+
+            X_tr = X_train_all.iloc[train_global_idx]
+            y_tr = y_all[train_global_idx]
+            sw_tr = sample_weights[train_global_idx]
+
+            X_va = X_train_all.iloc[val_global_idx]
+            y_va = y_all[val_global_idx]
+
+            teacher_tr = (
+                teacher_oof[synth_tr_subidx]
+                if teacher_oof is not None and len(teacher_oof) == len(synth_indices)
+                else None
+            )
 
             model = get_model(self.model_name, params=params.copy(), device=self.device)
 
-            with timer(f"Fold {fold + 1} Training"):
+            with timer(f"Fold {fold + 1} Training ({len(X_tr)} train rows, {len(X_va)} val rows)"):
                 model.fit(
-                    X_tr, y_tr, X_va, y_va,
+                    X_tr,
+                    y_tr,
+                    X_va,
+                    y_va,
+                    sample_weight=sw_tr,
                     teacher_train=teacher_tr,
                     X_test=X_test,
-                    teacher_test=teacher_test
+                    teacher_test=teacher_test,
                 )
 
             val_preds = model.predict_proba(X_va)
-            oof_preds[val_idx] = val_preds
+            oof_preds[synth_va_subidx] = val_preds
 
             fold_auc = roc_auc_score(y_va, val_preds)
             fold_scores.append(fold_auc)
             logging.info(f"--> Fold {fold + 1} ROC-AUC: {fold_auc:.5f}")
 
-            # Accumulate test predictions across folds
+            # Accumulate test predictions
             test_preds += model.predict_proba(X_test) / self.train_cfg.n_splits
 
-            # Clean memory
-            del X_tr, y_tr, X_va, y_va, model
+            # Memory garbage collection
+            del X_tr, y_tr, sw_tr, X_va, y_va, model
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -169,26 +202,40 @@ class CrossValidationEngine:
             gc.collect()
 
         # 4. Overall Out-Of-Fold Evaluation
-        overall_oof_auc = roc_auc_score(y, oof_preds)
+        overall_oof_auc = roc_auc_score(y_synth, oof_preds)
         logging.info("=" * 70)
-        logging.info(f"5-FOLD CV COMPLETE: Overall OOF ROC-AUC = {overall_oof_auc:.5f}")
-        logging.info(f"Mean Fold AUC: {np.mean(fold_scores):.5f} | Std: {np.std(fold_scores):.5f}")
+        logging.info(f"5-FOLD CV COMPLETE: Overall Synthetic OOF ROC-AUC = {overall_oof_auc:.5f}")
+        logging.info(
+            f"Mean Fold AUC: {np.mean(fold_scores):.5f} | Std: {np.std(fold_scores):.5f}"
+        )
         logging.info("=" * 70)
 
         # 5. Save Outputs & Submissions
-        np.save(os.path.join(self.paths.output_dir, f"oof_preds_{self.model_name}.npy"), oof_preds)
-        np.save(os.path.join(self.paths.output_dir, f"test_preds_{self.model_name}.npy"), test_preds)
+        np.save(
+            os.path.join(self.paths.output_dir, f"oof_preds_{self.model_name}.npy"),
+            oof_preds,
+        )
+        np.save(
+            os.path.join(self.paths.output_dir, f"test_preds_{self.model_name}.npy"),
+            test_preds,
+        )
 
-        submission_path = os.path.join(self.paths.submissions_dir, f"submission_{self.model_name}.csv")
-        sub_df = pd.DataFrame({
-            self.feature_cfg.id_col: test_ids,
-            self.feature_cfg.target_col: test_preds
-        })
+        submission_path = os.path.join(
+            self.paths.submissions_dir, f"submission_{self.model_name}.csv"
+        )
+        sub_df = pd.DataFrame(
+            {self.feature_cfg.id_col: test_ids, self.feature_cfg.target_col: test_preds}
+        )
         sub_df.to_csv(submission_path, index=False)
-        logging.info(f"Generated Submission: {submission_path}")
-
-        # Also write standard submission.csv in root for immediate submission
         sub_df.to_csv("submission.csv", index=False)
-        logging.info("Generated default 'submission.csv' ready for Kaggle submission!")
+        logging.info(f"Generated Submissions: '{submission_path}' & 'submission.csv'")
+
+        # 6. Domain 1: Safe Post-Processing Exact-Match Target Leakage Mining
+        if orig_df is not None:
+            postprocessor = ExactMatchPostprocessor(self.paths, self.feature_cfg)
+            matches = postprocessor.find_exact_matches(test_synth, orig_df)
+            if len(matches) > 0:
+                postprocessor.apply_overrides(submission_path, matches)
+                postprocessor.apply_overrides("submission.csv", matches)
 
         return overall_oof_auc, oof_preds, test_preds
