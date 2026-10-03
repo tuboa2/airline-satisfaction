@@ -20,7 +20,7 @@ from src.dataset import DatasetIngestion
 from src.features import FeaturePipeline
 from src.models import get_model
 from src.postprocess import ExactMatchPostprocessor
-from src.utils import detect_hardware, seed_everything, timer
+from src.utils import detect_hardware, resolve_binary_target, seed_everything, timer
 
 
 class CrossValidationEngine:
@@ -68,7 +68,7 @@ class CrossValidationEngine:
         ingestion = DatasetIngestion(self.paths, self.feature_cfg, self.train_cfg)
         unified_train, test_synth, sample_weights, orig_df = ingestion.load_and_prepare()
 
-        y_all = unified_train[self.feature_cfg.target_col].astype(int).values
+        y_all = resolve_binary_target(unified_train[self.feature_cfg.target_col])
         test_ids = (
             test_synth[self.feature_cfg.id_col].values
             if self.feature_cfg.id_col in test_synth.columns

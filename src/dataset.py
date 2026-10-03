@@ -13,7 +13,7 @@ import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 
 from src.config import FeatureConfig, PathConfig, TrainConfig
-from src.utils import get_logger, timer
+from src.utils import get_logger, resolve_binary_target, timer
 
 
 class DatasetIngestion:
@@ -47,13 +47,7 @@ class DatasetIngestion:
         target_candidates = ["satisfaction", "Satisfaction", "target", "Target"]
         for tc in target_candidates:
             if tc in data.columns:
-                if data[tc].dtype in [object, bool, str]:
-                    val_str = data[tc].astype(str).str.lower().str.strip()
-                    data[self.feature_cfg.target_col] = (val_str == "satisfied").astype(
-                        int
-                    )
-                else:
-                    data[self.feature_cfg.target_col] = data[tc].astype(int)
+                data[self.feature_cfg.target_col] = resolve_binary_target(data[tc])
                 if tc != self.feature_cfg.target_col:
                     data = data.drop(columns=[tc])
                 break

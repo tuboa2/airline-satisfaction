@@ -11,7 +11,7 @@ from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
 
 from src.config import FeatureConfig
-from src.utils import reduce_mem_usage, timer
+from src.utils import reduce_mem_usage, resolve_binary_target, timer
 
 
 class FeaturePipeline:
@@ -29,6 +29,7 @@ class FeaturePipeline:
     def __init__(self, config: FeatureConfig = FeatureConfig()):
         self.config = config
         self.label_encoders: dict[str, LabelEncoder] = {}
+        self.label_encoder_dicts: dict[str, dict[str, int]] = {}
         self.freq_maps: dict[str, dict[str, float]] = {}
         self.count_maps: dict[str, dict[str, int]] = {}
 
@@ -144,25 +145,32 @@ class FeaturePipeline:
                     (train_core.values - self.scaler_mean) / self.scaler_std
                 ).astype(np.float32)
                 y_train = (
-                    (train_df[self.config.target_col] == 1).values
+                    resolve_binary_target(train_df[self.config.target_col])
                     if self.config.target_col in train_df.columns
                     else None
                 )
 
-                if y_train is not None:
+                if y_train is not None and (y_train == 1).sum() > 0 and (y_train == 0).sum() > 0:
+                    pos_mask = (y_train == 1)
+                    neg_mask = (y_train == 0)
                     # Positive and negative global centroids
-                    self.global_centroid_1 = X_train_scaled[y_train].mean(axis=0)
-                    self.global_centroid_0 = X_train_scaled[~y_train].mean(axis=0)
+                    self.global_centroid_1 = X_train_scaled[pos_mask].mean(axis=0)
+                    self.global_centroid_0 = X_train_scaled[neg_mask].mean(axis=0)
 
                     # Sub-cluster centroids for positive & negative manifolds
                     n_c = self.config.kmeans_clusters_per_class
                     self.mbk_1 = MiniBatchKMeans(
                         n_clusters=n_c, batch_size=4096, random_state=42, n_init=3
-                    ).fit(X_train_scaled[y_train])
+                    ).fit(X_train_scaled[pos_mask])
 
                     self.mbk_0 = MiniBatchKMeans(
                         n_clusters=n_c, batch_size=4096, random_state=42, n_init=3
-                    ).fit(X_train_scaled[~y_train])
+                    ).fit(X_train_scaled[neg_mask])
+                else:
+                    self.global_centroid_1 = None
+                    self.global_centroid_0 = None
+                    self.mbk_1 = None
+                    self.mbk_0 = None
 
                 # Local Outlier / Mode Collapse Anomaly Clustering on full data
                 full_arr_delay = full_df["Arrival Delay in Minutes"].fillna(
@@ -222,6 +230,7 @@ class FeaturePipeline:
                 le = LabelEncoder()
                 le.fit(col_data_map[col])
                 self.label_encoders[col] = le
+                self.label_encoder_dicts[col] = {val: idx for idx, val in enumerate(le.classes_)}
 
             # 5. Linear Rotational Variance via TruncatedSVD (Domain 4)
             if self.config.enable_svd_manifolds:
@@ -245,12 +254,7 @@ class FeaturePipeline:
 
             # 6. Multi-Way Bayesian Target Encoding with Leak-Free OOF (Domain 4)
             if self.config.target_col in train_df.columns:
-                y_raw = train_df[self.config.target_col]
-                y_train_num = (
-                    (y_raw == 1).values.astype(np.float32)
-                    if y_raw.dtype != int
-                    else y_raw.values.astype(np.float32)
-                )
+                y_train_num = resolve_binary_target(train_df[self.config.target_col]).astype(np.float32)
                 self.global_target_mean = float(y_train_num.mean())
                 smooth_prior = 10.0
 
@@ -614,16 +618,13 @@ class FeaturePipeline:
             ]
 
             for col in cat_columns:
-                le = self.label_encoders.get(col)
-                if le is not None:
-                    # Map known categories; unknown get -1
-                    known_classes = set(le.classes_)
+                mapping = self.label_encoder_dicts.get(col)
+                if mapping is not None:
                     data[col] = (
                         data[col]
                         .astype(str)
-                        .map(
-                            lambda s: le.transform([s])[0] if s in known_classes else -1
-                        )
+                        .map(mapping)
+                        .fillna(-1)
                         .astype(np.int16)
                     )
                 else:

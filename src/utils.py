@@ -106,3 +106,25 @@ def timer(name: str):
     t0 = time.time()
     yield
     logging.info(f"[{name}] completed in {time.time() - t0:.2f} seconds.")
+
+
+def resolve_binary_target(series: pd.Series | np.ndarray) -> np.ndarray:
+    """
+    Robustly resolves binary satisfaction targets across all dtypes:
+    boolean (True/False), numeric (1/0 or 1.0/0.0), and text
+    ('satisfied'/'neutral or dissatisfied', 'true'/'false', '1'/'0').
+    Returns an int32 numpy array with values in {0, 1}.
+    """
+    if isinstance(series, np.ndarray):
+        series = pd.Series(series)
+    elif not isinstance(series, pd.Series):
+        series = pd.Series(list(series))
+
+    if pd.api.types.is_bool_dtype(series):
+        return series.astype(np.int32).values
+    if pd.api.types.is_numeric_dtype(series):
+        return (series.astype(float) == 1.0).astype(np.int32).values
+
+    val_str = series.astype(str).str.lower().str.strip()
+    is_pos = val_str.isin(["satisfied", "true", "1", "t", "yes", "y"])
+    return is_pos.astype(np.int32).values

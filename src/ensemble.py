@@ -22,7 +22,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from src.config import FeatureConfig, PathConfig
-from src.utils import get_logger, timer
+from src.utils import get_logger, resolve_binary_target, timer
 
 
 class EnsembleOptimizer:
@@ -49,15 +49,9 @@ class EnsembleOptimizer:
         """Loads true binary targets from training dataset."""
         train_df = pd.read_csv(self.paths.train_path)
         if self.feature_cfg.target_col in train_df.columns:
-            target = train_df[self.feature_cfg.target_col]
-            if target.dtype in [object, bool, str]:
-                val_str = target.astype(str).str.lower().str.strip()
-                y = (val_str == "satisfied").astype(int).values
-            else:
-                y = target.astype(int).values
+            return resolve_binary_target(train_df[self.feature_cfg.target_col])
         else:
             raise KeyError(f"Target column '{self.feature_cfg.target_col}' not found in train.csv!")
-        return y
 
     def load_test_ids(self) -> np.ndarray:
         """Loads test passenger IDs."""

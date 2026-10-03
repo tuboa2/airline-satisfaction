@@ -10,7 +10,7 @@ import os
 import pandas as pd
 
 from src.config import FeatureConfig, PathConfig
-from src.utils import get_logger, timer
+from src.utils import get_logger, resolve_binary_target, timer
 
 
 class ExactMatchPostprocessor:
@@ -66,6 +66,9 @@ class ExactMatchPostprocessor:
             ref_subset = reference_df[
                 feature_cols + [self.feature_cfg.target_col]
             ].copy()
+            ref_subset[self.feature_cfg.target_col] = resolve_binary_target(
+                ref_subset[self.feature_cfg.target_col]
+            )
 
             # Impute arrival delays consistently
             if (
