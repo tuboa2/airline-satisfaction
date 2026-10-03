@@ -8,6 +8,7 @@ Implements:
 5. Auto-selection of superior ensemble strategy and deterministic test override hooks.
 """
 
+import glob
 import os
 from typing import Any
 
@@ -17,7 +18,7 @@ from scipy.optimize import minimize
 from scipy.special import expit, logit
 from scipy.stats import rankdata
 from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import RidgeCV
+from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
@@ -59,30 +60,35 @@ class EnsembleOptimizer:
         return test_df[self.feature_cfg.id_col].values
 
     def discover_models(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-        """Scans outputs directory for completed model OOF and test predictions."""
+        """Scans outputs directory dynamically for completed model OOF and test predictions."""
         available_models = {}
-        candidate_slugs = [
-            "lightgbm",
-            "catboost",
-            "xgboost",
-            "resnet",
-            "realmlp",
-            "tabular_resnet",
-            "transformer",
-            "ft_transformer",
-        ]
+        canonical_map = {
+            "lgbm": "lightgbm",
+            "cb": "catboost",
+            "cat": "catboost",
+            "xgb": "xgboost",
+            "ft": "ft_transformer",
+            "transformer": "ft_transformer",
+            "realmlp": "tabular_resnet",
+            "resnet": "tabular_resnet",
+        }
 
-        for slug in candidate_slugs:
-            oof_path = os.path.join(self.paths.output_dir, f"oof_preds_{slug}.npy")
+        pattern = os.path.join(self.paths.output_dir, "oof_preds_*.npy")
+        for oof_path in sorted(glob.glob(pattern)):
+            fname = os.path.basename(oof_path)
+            slug = fname[len("oof_preds_") : -len(".npy")]
             test_path = os.path.join(self.paths.output_dir, f"test_preds_{slug}.npy")
 
-            if os.path.exists(oof_path) and os.path.exists(test_path):
+            if os.path.exists(test_path):
                 oof = np.load(oof_path)
                 test = np.load(test_path)
-                # Verify non-trivial predictions
                 if len(oof) > 0 and len(test) > 0:
-                    available_models[slug] = (oof, test)
-                    self.logger.info(f"Discovered completed model outputs for: '{slug}'")
+                    c_name = canonical_map.get(slug.lower(), slug.lower())
+                    if c_name not in available_models:
+                        available_models[c_name] = (oof, test)
+                        self.logger.info(
+                            f"Discovered completed model outputs for: '{c_name}' (source file: '{fname}')"
+                        )
 
         return available_models
 
@@ -158,7 +164,7 @@ class EnsembleOptimizer:
         y_true: np.ndarray,
     ) -> tuple[np.ndarray, float, np.ndarray, dict[str, float]]:
         """
-        Bounded SLSQP Direct ROC-AUC Maximization in Calibrated Logit Space.
+        Direct ROC-AUC Maximization in Calibrated Logit Space via Nelder-Mead.
         Formula: z_blend = sum(w_i * z_i), p_blend = sigmoid(z_blend).
         """
         X_oof_logits = np.column_stack([cal_oof_logits[m] for m in model_names])
@@ -166,21 +172,20 @@ class EnsembleOptimizer:
         n = len(model_names)
 
         def objective(w):
-            z_blend = np.dot(X_oof_logits, w)
+            weights = np.maximum(0.0, w)
+            if weights.sum() == 0:
+                weights = np.ones_like(weights)
+            weights = weights / weights.sum()
+            z_blend = np.dot(X_oof_logits, weights)
             p_blend = expit(z_blend)
             return -roc_auc_score(y_true, p_blend)
 
         init_w = np.ones(n) / n
-        bounds = [(0.0, 1.0) for _ in range(n)]
-        constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
-
         res = minimize(
             objective,
             init_w,
-            method="SLSQP",
-            bounds=bounds,
-            constraints=constraints,
-            options={"maxiter": 1000, "ftol": 1e-6},
+            method="Nelder-Mead",
+            options={"maxiter": 1000},
         )
 
         opt_w = np.maximum(0.0, res.x)
@@ -240,18 +245,35 @@ class EnsembleOptimizer:
         oof_meta_preds = np.zeros(len(y_true), dtype=np.float32)
         test_meta_preds = np.zeros(len(X_meta_test), dtype=np.float32)
 
-        alphas = [0.1, 1.0, 5.0, 10.0, 15.0, 20.0, 50.0, 100.0]
+        alphas = [0.01, 0.1, 1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]
+
+        best_alpha = 10.0
+        best_cv_auc = -1.0
+        for alpha in alphas:
+            fold_aucs = []
+            for tr_idx, va_idx in skf.split(X_meta_oof, y_true):
+                clf = Ridge(alpha=alpha, random_state=42)
+                clf.fit(X_meta_oof[tr_idx], y_true[tr_idx])
+                preds = clf.predict(X_meta_oof[va_idx])
+                fold_aucs.append(roc_auc_score(y_true[va_idx], preds))
+            mean_auc = float(np.mean(fold_aucs))
+            if mean_auc > best_cv_auc:
+                best_cv_auc = mean_auc
+                best_alpha = alpha
+
+        self.logger.info(
+            f"Ridge Meta-Learner selected optimal alpha={best_alpha} (Mean CV ROC-AUC: {best_cv_auc:.5f})"
+        )
 
         for tr_idx, va_idx in skf.split(X_meta_oof, y_true):
             X_tr, y_tr = X_meta_oof[tr_idx], y_true[tr_idx]
-            X_va = X_meta_oof[val_idx] if "val_idx" in locals() else X_meta_oof[va_idx]
-            y_va = y_true[va_idx]
+            X_va = X_meta_oof[va_idx]
 
-            ridge = RidgeCV(alphas=alphas, scoring="roc_auc")
-            ridge.fit(X_tr, y_tr)
+            clf = Ridge(alpha=best_alpha, random_state=42)
+            clf.fit(X_tr, y_tr)
 
-            oof_meta_preds[va_idx] = ridge.predict(X_va)
-            test_meta_preds += ridge.predict(X_meta_test) / 5.0
+            oof_meta_preds[va_idx] = clf.predict(X_va)
+            test_meta_preds += clf.predict(X_meta_test) / 5.0
 
         best_auc = roc_auc_score(y_true, oof_meta_preds)
         return oof_meta_preds, best_auc, test_meta_preds
@@ -305,11 +327,11 @@ class EnsembleOptimizer:
         # 4. Calibration & Logit Conversion
         cal_oof_logits, cal_test_logits = self.calibrate_and_logit(models_dict, y_true)
 
-        # 5. Strategy 2: Bounded SLSQP Logit Blending
+        # 5. Strategy 2: Bounded Logit Blending (Nelder-Mead)
         oof_slsqp, auc_slsqp, test_slsqp, w_slsqp = self.blend_logit_slsqp(
             model_names, cal_oof_logits, cal_test_logits, y_true
         )
-        self.logger.info(f"Strategy 2 (Bounded SLSQP Logit Blend) : OOF ROC-AUC = {auc_slsqp:.5f}")
+        self.logger.info(f"Strategy 2 (Nelder-Mead Logit Blend)   : OOF ROC-AUC = {auc_slsqp:.5f}")
         for m, w in w_slsqp.items():
             self.logger.info(f"    - Weight for {m:<18}: {w:.4f}")
 

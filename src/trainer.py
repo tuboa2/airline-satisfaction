@@ -224,6 +224,27 @@ class CrossValidationEngine:
             test_preds,
         )
 
+        canonical_map = {
+            "lgbm": "lightgbm",
+            "cb": "catboost",
+            "cat": "catboost",
+            "xgb": "xgboost",
+            "ft": "ft_transformer",
+            "transformer": "ft_transformer",
+            "realmlp": "tabular_resnet",
+            "resnet": "tabular_resnet",
+        }
+        canonical_name = canonical_map.get(self.model_name.lower(), self.model_name.lower())
+        if canonical_name != self.model_name.lower():
+            np.save(
+                os.path.join(self.paths.output_dir, f"oof_preds_{canonical_name}.npy"),
+                oof_preds,
+            )
+            np.save(
+                os.path.join(self.paths.output_dir, f"test_preds_{canonical_name}.npy"),
+                test_preds,
+            )
+
         submission_path = os.path.join(
             self.paths.submissions_dir, f"submission_{self.model_name}.csv"
         )
